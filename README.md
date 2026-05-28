@@ -51,3 +51,7 @@ Abre http://localhost:3000
 ## Aviso médico
 
 Esta app es una herramienta de exploración personal. No es diagnóstico médico ni sustituto de atención profesional.
+
+
+---
+Deployed via Vercel.
