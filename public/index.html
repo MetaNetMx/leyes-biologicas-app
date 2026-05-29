@@ -9,12 +9,7 @@
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <style>
-  :root {
-    --color-base: #1a3a52;
-    --color-soft: #5c7c8c;
-    --color-bg: #faf7f2;
-    --color-accent: #c47b5a;
-  }
+  :root { --color-base:#1a3a52; --color-soft:#5c7c8c; --color-bg:#faf7f2; --color-accent:#c47b5a; }
   html, body { background: var(--color-bg); font-family: 'Inter', system-ui, sans-serif; }
   .gradient-bg { background: linear-gradient(135deg, #faf7f2 0%, #f0ebe1 100%); }
   .card-shadow { box-shadow: 0 10px 40px -10px rgba(26, 58, 82, 0.15); }
@@ -34,15 +29,25 @@
 const { useState, useEffect, useRef } = React;
 const API_BASE = window.location.origin;
 const CHAT_ENDPOINT = `${API_BASE}/api/chat`;
+const TTS_ENDPOINT = `${API_BASE}/api/tts`;
 
-async function llamarBackend({ mensajes, onChunk, onError }) {
+function getSessionId() {
+  let sid = sessionStorage.getItem('lb_session_id');
+  if (!sid) {
+    sid = 'sess_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+    sessionStorage.setItem('lb_session_id', sid);
+  }
+  return sid;
+}
+
+async function llamarBackend({ mensajes, sessionId, onChunk }) {
   const ctrl = new AbortController();
   const timeoutId = setTimeout(() => ctrl.abort(), 55000);
   try {
     const res = await fetch(CHAT_ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: mensajes }),
+      body: JSON.stringify({ messages: mensajes, session_id: sessionId }),
       signal: ctrl.signal,
     });
     if (!res.ok) {
@@ -51,8 +56,7 @@ async function llamarBackend({ mensajes, onChunk, onError }) {
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = '';
-    let textoCompleto = '';
+    let buffer = '', textoCompleto = '';
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -65,12 +69,8 @@ async function llamarBackend({ mensajes, onChunk, onError }) {
         if (data === '[DONE]') continue;
         try {
           const ev = JSON.parse(data);
-          if (ev.chunk) {
-            textoCompleto += ev.chunk;
-            if (onChunk) onChunk(textoCompleto);
-          } else if (ev.error) {
-            throw new Error(ev.error);
-          }
+          if (ev.chunk) { textoCompleto += ev.chunk; if (onChunk) onChunk(textoCompleto); }
+          else if (ev.error) throw new Error(ev.error);
         } catch (e) {
           if (e.message?.startsWith('Servidor')) throw e;
         }
@@ -80,57 +80,32 @@ async function llamarBackend({ mensajes, onChunk, onError }) {
     return textoCompleto;
   } catch (e) {
     clearTimeout(timeoutId);
-    if (e.name === 'AbortError') {
-      throw new Error('El servidor tardó demasiado. Intenta dividir tu mensaje en partes más cortas.');
-    }
-    if (onError) onError(e);
+    if (e.name === 'AbortError') throw new Error('El servidor tardó demasiado. Intenta de nuevo.');
     throw e;
   }
 }
 
-// Parser de respuesta robusto
 function parsearRespuesta(texto) {
   if (!texto || texto.trim().length === 0) return null;
-
-  // Limpiar markdown code fences si vienen
   let limpio = texto.trim();
   if (limpio.startsWith('```json')) limpio = limpio.slice(7);
   if (limpio.startsWith('```')) limpio = limpio.slice(3);
   if (limpio.endsWith('```')) limpio = limpio.slice(0, -3);
   limpio = limpio.trim();
-
-  // Buscar primer { y último } para el JSON
   const inicio = limpio.indexOf('{');
   const fin = limpio.lastIndexOf('}');
   if (inicio === -1 || fin === -1) return null;
-
   const jsonStr = limpio.slice(inicio, fin + 1);
-
-  // Intentar parsear directo
   try { return JSON.parse(jsonStr); } catch (e) {}
-
-  // Limpiar trailing commas
-  try {
-    return JSON.parse(jsonStr.replace(/,(\s*[}\]])/g, '$1'));
-  } catch (e) {}
-
-  // Si todo falla, intentar extraer al menos el mensaje
+  try { return JSON.parse(jsonStr.replace(/,(\s*[}\]])/g, '$1')); } catch (e) {}
   const msgMatch = limpio.match(/"mensaje"\s*:\s*"((?:[^"\\]|\\.)*)"/s);
-  if (msgMatch) {
-    return {
-      mensaje: msgMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"'),
-      siguiente_accion: 'pregunta_abierta',
-    };
-  }
+  if (msgMatch) return { mensaje: msgMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"'), siguiente_accion: 'pregunta_abierta' };
   return null;
 }
-
-// =================== SPEECH SYNTHESIS (Web Speech API) ===================
 
 function getMejorVozEspanol() {
   const voces = window.speechSynthesis.getVoices();
   if (!voces.length) return null;
-  // Prioridad: español mexicano > español genérico
   const orden = ['es-MX', 'es-419', 'es-US', 'es-ES', 'es'];
   for (const lang of orden) {
     const v = voces.find(v => v.lang.startsWith(lang));
@@ -139,7 +114,13 @@ function getMejorVozEspanol() {
   return voces.find(v => v.lang.startsWith('es')) || voces[0];
 }
 
-// =================== COMPONENTES ===================
+function descargarBlob(blob, nombre) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = nombre;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 function Logo() {
   return (
@@ -158,9 +139,7 @@ function DisclaimerScreen({ onAccept }) {
     <div className="min-h-screen gradient-bg flex items-center justify-center p-6">
       <div className="bg-white rounded-2xl card-shadow max-w-2xl p-10 fade-in">
         <Logo />
-        <h1 className="text-3xl font-semibold text-[var(--color-base)] mt-8 mb-4">
-          Antes de comenzar
-        </h1>
+        <h1 className="text-3xl font-semibold text-[var(--color-base)] mt-8 mb-4">Antes de comenzar</h1>
         <p className="text-stone-700 leading-relaxed mb-4">
           Esta es una herramienta de autoconocimiento basada en las Leyes Biológicas de Hamer (marco de Mark Pfister). Te acompaña a explorar el sentido emocional y biológico de un síntoma físico.
         </p>
@@ -171,45 +150,18 @@ function DisclaimerScreen({ onAccept }) {
         </div>
         <label className="flex items-start gap-3 mb-6 cursor-pointer">
           <input type="checkbox" checked={checked} onChange={(e) => setChecked(e.target.checked)} className="mt-1 w-5 h-5 accent-[var(--color-accent)]" />
-          <span className="text-stone-700 text-sm">
-            Entiendo que esto es una herramienta de exploración personal y no reemplaza atención médica.
-          </span>
+          <span className="text-stone-700 text-sm">Entiendo que esto es una herramienta de exploración personal y no reemplaza atención médica.</span>
         </label>
-        <button
-          onClick={onAccept}
-          disabled={!checked}
-          className={`w-full py-3 rounded-lg font-medium transition ${checked ? 'bg-[var(--color-base)] text-white hover:bg-[var(--color-soft)]' : 'bg-stone-200 text-stone-400 cursor-not-allowed'}`}
-        >
-          Empezar
-        </button>
+        <button onClick={onAccept} disabled={!checked} className={`w-full py-3 rounded-lg font-medium transition ${checked ? 'bg-[var(--color-base)] text-white hover:bg-[var(--color-soft)]' : 'bg-stone-200 text-stone-400 cursor-not-allowed'}`}>Empezar</button>
       </div>
     </div>
   );
 }
 
-// Renderiza texto con markdown básico (negritas con **)
-function TextoFormateado({ texto }) {
-  if (!texto) return null;
-  // partir en párrafos
-  const partes = texto.split(/\n\n+/);
-  return (
-    <div className="space-y-2">
-      {partes.map((p, i) => (
-        <p key={i} className="whitespace-pre-wrap leading-relaxed">
-          {renderInlineMd(p)}
-        </p>
-      ))}
-    </div>
-  );
-}
-
 function renderInlineMd(text) {
-  // negritas **xxx**
   const partes = [];
   const regex = /\*\*([^*]+)\*\*/g;
-  let lastIdx = 0;
-  let m;
-  let key = 0;
+  let lastIdx = 0, m, key = 0;
   while ((m = regex.exec(text)) !== null) {
     if (m.index > lastIdx) partes.push(<span key={key++}>{text.slice(lastIdx, m.index)}</span>);
     partes.push(<strong key={key++} className="text-[var(--color-base)]">{m[1]}</strong>);
@@ -217,6 +169,16 @@ function renderInlineMd(text) {
   }
   if (lastIdx < text.length) partes.push(<span key={key++}>{text.slice(lastIdx)}</span>);
   return partes;
+}
+
+function TextoFormateado({ texto }) {
+  if (!texto) return null;
+  const partes = texto.split(/\n\n+/);
+  return (
+    <div className="space-y-2">
+      {partes.map((p, i) => <p key={i} className="whitespace-pre-wrap leading-relaxed">{renderInlineMd(p)}</p>)}
+    </div>
+  );
 }
 
 function MensajeBurbuja({ rol, contenido }) {
@@ -238,12 +200,12 @@ function MensajeBurbuja({ rol, contenido }) {
   );
 }
 
-// MEDITACIÓN con reproductor de audio
-function MeditacionCard({ texto, sintomaContexto }) {
-  const [estado, setEstado] = useState('idle'); // idle | playing | paused
+function MeditacionCard({ texto }) {
+  const [estado, setEstado] = useState('idle');
   const [voces, setVoces] = useState([]);
   const [vozSel, setVozSel] = useState(null);
-  const utteranceRef = useRef(null);
+  const [descargandoMp3, setDescargandoMp3] = useState(false);
+  const [errorMp3, setErrorMp3] = useState(null);
   const supported = typeof window !== 'undefined' && 'speechSynthesis' in window;
 
   useEffect(() => {
@@ -251,49 +213,52 @@ function MeditacionCard({ texto, sintomaContexto }) {
     const cargarVoces = () => {
       const lista = window.speechSynthesis.getVoices().filter(v => v.lang.startsWith('es'));
       setVoces(lista);
-      if (!vozSel && lista.length) {
-        const def = getMejorVozEspanol();
-        setVozSel(def);
-      }
+      if (!vozSel && lista.length) setVozSel(getMejorVozEspanol());
     };
     cargarVoces();
     window.speechSynthesis.onvoiceschanged = cargarVoces;
-    return () => {
-      try { window.speechSynthesis.cancel(); } catch (e) {}
-    };
+    return () => { try { window.speechSynthesis.cancel(); } catch (e) {} };
   }, []);
 
-  // Limpiar markdown del texto para TTS
   const textoLimpio = texto.replace(/\*\*/g, '').replace(/---+/g, '...').replace(/##+\s*/g, '');
 
   const play = () => {
     if (!supported || !vozSel) return;
     try { window.speechSynthesis.cancel(); } catch (e) {}
     const u = new SpeechSynthesisUtterance(textoLimpio);
-    u.voice = vozSel;
-    u.lang = vozSel.lang;
-    u.rate = 0.82;
-    u.pitch = 0.95;
-    u.onend = () => setEstado('idle');
-    u.onerror = () => setEstado('idle');
-    utteranceRef.current = u;
+    u.voice = vozSel; u.lang = vozSel.lang; u.rate = 0.82; u.pitch = 0.95;
+    u.onend = () => setEstado('idle'); u.onerror = () => setEstado('idle');
     window.speechSynthesis.speak(u);
     setEstado('playing');
   };
+  const pause = () => { window.speechSynthesis.pause(); setEstado('paused'); };
+  const resume = () => { window.speechSynthesis.resume(); setEstado('playing'); };
+  const stop = () => { window.speechSynthesis.cancel(); setEstado('idle'); };
 
-  const pause = () => {
-    window.speechSynthesis.pause();
-    setEstado('paused');
+  const descargarTexto = () => {
+    const blob = new Blob([textoLimpio], { type: 'text/plain;charset=utf-8' });
+    descargarBlob(blob, 'meditacion.txt');
   };
 
-  const resume = () => {
-    window.speechSynthesis.resume();
-    setEstado('playing');
-  };
-
-  const stop = () => {
-    window.speechSynthesis.cancel();
-    setEstado('idle');
+  const descargarAudio = async () => {
+    setDescargandoMp3(true); setErrorMp3(null);
+    try {
+      const res = await fetch(TTS_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: textoLimpio }),
+      });
+      if (!res.ok) {
+        const errTxt = await res.text();
+        throw new Error(`Error ${res.status}: ${errTxt.substring(0, 200)}`);
+      }
+      const blob = await res.blob();
+      descargarBlob(blob, 'meditacion.wav');
+    } catch (e) {
+      setErrorMp3(e.message);
+    } finally {
+      setDescargandoMp3(false);
+    }
   };
 
   return (
@@ -305,69 +270,60 @@ function MeditacionCard({ texto, sintomaContexto }) {
         <h3 className="font-semibold">Meditación de cierre</h3>
       </div>
 
-      {supported ? (
-        <div className="bg-stone-50 rounded-xl p-4 mb-4">
-          <div className="flex items-center gap-3 mb-3">
+      {supported && (
+        <div className="bg-stone-50 rounded-xl p-4 mb-3">
+          <div className="flex items-center gap-2 flex-wrap mb-3">
             {estado === 'idle' && (
-              <button onClick={play} className="flex items-center gap-2 px-4 py-2 bg-[var(--color-accent)] text-white rounded-lg hover:opacity-90 transition">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-                Reproducir audio
+              <button onClick={play} className="flex items-center gap-2 px-4 py-2 bg-[var(--color-accent)] text-white rounded-lg hover:opacity-90 transition text-sm">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>Escuchar ahora
               </button>
             )}
             {estado === 'playing' && (
-              <button onClick={pause} className="flex items-center gap-2 px-4 py-2 bg-[var(--color-base)] text-white rounded-lg hover:opacity-90 transition">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14"/><rect x="14" y="5" width="4" height="14"/></svg>
-                Pausar
+              <button onClick={pause} className="flex items-center gap-2 px-4 py-2 bg-[var(--color-base)] text-white rounded-lg text-sm">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14"/><rect x="14" y="5" width="4" height="14"/></svg>Pausar
               </button>
             )}
             {estado === 'paused' && (
-              <button onClick={resume} className="flex items-center gap-2 px-4 py-2 bg-[var(--color-accent)] text-white rounded-lg hover:opacity-90 transition">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-                Continuar
+              <button onClick={resume} className="flex items-center gap-2 px-4 py-2 bg-[var(--color-accent)] text-white rounded-lg text-sm">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>Continuar
               </button>
             )}
             {estado !== 'idle' && (
-              <button onClick={stop} className="px-3 py-2 border border-stone-300 rounded-lg hover:bg-stone-100 transition text-sm">
-                Detener
-              </button>
+              <button onClick={stop} className="px-3 py-2 border border-stone-300 rounded-lg hover:bg-stone-100 text-xs">Detener</button>
             )}
             {voces.length > 1 && (
-              <select
-                value={vozSel?.name || ''}
-                onChange={(e) => {
-                  const v = voces.find(x => x.name === e.target.value);
-                  if (v) {
-                    setVozSel(v);
-                    if (estado === 'playing') { stop(); setTimeout(play, 100); }
-                  }
-                }}
-                className="ml-auto text-xs border border-stone-300 rounded px-2 py-1.5 bg-white"
-              >
-                {voces.map(v => (
-                  <option key={v.name} value={v.name}>{v.name} ({v.lang})</option>
-                ))}
+              <select value={vozSel?.name || ''} onChange={(e) => { const v = voces.find(x => x.name === e.target.value); if (v) { setVozSel(v); if (estado === 'playing') { stop(); setTimeout(play, 100); } } }}
+                className="ml-auto text-xs border border-stone-300 rounded px-2 py-1.5 bg-white">
+                {voces.map(v => <option key={v.name} value={v.name}>{v.name} ({v.lang})</option>)}
               </select>
             )}
           </div>
-          <p className="text-xs text-stone-600">
-            {estado === 'idle' && 'Audio generado por el navegador. Usa auriculares para mejor experiencia.'}
-            {estado === 'playing' && '🎧 Reproduciendo... Quédate quieto y sigue las instrucciones.'}
-            {estado === 'paused' && 'Pausado. Continúa cuando estés listo.'}
+          <p className="text-xs text-stone-500">
+            {estado === 'idle' && 'Reproducción rápida con voz del navegador.'}
+            {estado === 'playing' && '🎧 Reproduciendo...'}
+            {estado === 'paused' && 'Pausado.'}
           </p>
-        </div>
-      ) : (
-        <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-sm text-amber-900">
-          Tu navegador no soporta reproducción de audio. Puedes leer la meditación abajo.
         </div>
       )}
 
-      <details className="text-sm">
-        <summary className="cursor-pointer text-stone-600 hover:text-stone-800 mb-2">
-          Ver / leer texto completo
-        </summary>
-        <div className="meditation-text mt-3 text-stone-700 max-h-96 overflow-y-auto p-3 bg-stone-50 rounded-lg">
-          {textoLimpio}
+      <div className="border-t border-stone-100 pt-3">
+        <p className="text-xs text-stone-500 mb-2">Descargar para usar offline:</p>
+        <div className="flex gap-2 flex-wrap">
+          <button onClick={descargarTexto} className="flex items-center gap-2 px-3 py-2 border border-stone-300 rounded-lg hover:bg-stone-50 text-sm">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Descargar texto (.txt)
+          </button>
+          <button onClick={descargarAudio} disabled={descargandoMp3} className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm ${descargandoMp3 ? 'bg-stone-200 text-stone-500 cursor-wait' : 'border border-stone-300 hover:bg-stone-50'}`}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            {descargandoMp3 ? 'Generando audio... (puede tardar 30s)' : 'Descargar audio (.wav)'}
+          </button>
         </div>
+        {errorMp3 && <p className="text-xs text-red-600 mt-2">{errorMp3}</p>}
+      </div>
+
+      <details className="text-sm mt-3">
+        <summary className="cursor-pointer text-stone-600 hover:text-stone-800">Ver texto completo</summary>
+        <div className="meditation-text mt-3 text-stone-700 max-h-96 overflow-y-auto p-3 bg-stone-50 rounded-lg">{textoLimpio}</div>
       </details>
     </div>
   );
@@ -376,21 +332,12 @@ function MeditacionCard({ texto, sintomaContexto }) {
 function PreguntaOpciones({ pregunta, onResponder }) {
   const [seleccion, setSeleccion] = useState(pregunta.multi_select ? [] : null);
   const multi = pregunta.multi_select;
-
   const toggle = (label) => {
-    if (multi) {
-      setSeleccion(seleccion.includes(label) ? seleccion.filter(x => x !== label) : [...seleccion, label]);
-    } else {
-      setSeleccion(label);
-    }
+    if (multi) setSeleccion(seleccion.includes(label) ? seleccion.filter(x => x !== label) : [...seleccion, label]);
+    else setSeleccion(label);
   };
-
   const valido = multi ? seleccion.length > 0 : seleccion !== null;
-  const enviar = () => {
-    const respuesta = multi ? seleccion.join(', ') : seleccion;
-    onResponder(`${pregunta.pregunta}\n→ ${respuesta}`);
-  };
-
+  const enviar = () => onResponder(`${pregunta.pregunta}\n→ ${multi ? seleccion.join(', ') : seleccion}`);
   return (
     <div className="bg-white border border-stone-200 rounded-2xl p-5 mb-4 card-shadow fade-in">
       <p className="font-medium text-[var(--color-base)] mb-3">{pregunta.pregunta}</p>
@@ -398,24 +345,14 @@ function PreguntaOpciones({ pregunta, onResponder }) {
         {pregunta.opciones?.map((op, i) => {
           const activo = multi ? seleccion.includes(op.label) : seleccion === op.label;
           return (
-            <button
-              key={i}
-              onClick={() => toggle(op.label)}
-              className={`w-full text-left p-3 rounded-lg border-2 transition text-sm ${activo ? 'border-[var(--color-accent)] bg-orange-50' : 'border-stone-200 hover:border-stone-300'}`}
-            >
+            <button key={i} onClick={() => toggle(op.label)} className={`w-full text-left p-3 rounded-lg border-2 transition text-sm ${activo ? 'border-[var(--color-accent)] bg-orange-50' : 'border-stone-200 hover:border-stone-300'}`}>
               <div className="font-medium text-stone-900">{op.label}</div>
               {op.desc && <div className="text-xs text-stone-600 mt-1">{op.desc}</div>}
             </button>
           );
         })}
       </div>
-      <button
-        onClick={enviar}
-        disabled={!valido}
-        className={`w-full py-2.5 rounded-lg font-medium text-sm transition ${valido ? 'bg-[var(--color-base)] text-white hover:bg-[var(--color-soft)]' : 'bg-stone-200 text-stone-400'}`}
-      >
-        Responder
-      </button>
+      <button onClick={enviar} disabled={!valido} className={`w-full py-2.5 rounded-lg font-medium text-sm transition ${valido ? 'bg-[var(--color-base)] text-white hover:bg-[var(--color-soft)]' : 'bg-stone-200 text-stone-400'}`}>Responder</button>
     </div>
   );
 }
@@ -437,9 +374,7 @@ function AnalisisCard({ analisis }) {
         ))}
       </div>
       {analisis.lectura_integrada && (
-        <div className="bg-stone-50 rounded-lg p-3 text-sm text-stone-700 whitespace-pre-wrap">
-          {analisis.lectura_integrada}
-        </div>
+        <div className="bg-stone-50 rounded-lg p-3 text-sm text-stone-700 whitespace-pre-wrap">{analisis.lectura_integrada}</div>
       )}
     </div>
   );
@@ -449,34 +384,15 @@ function InputLibre({ onEnviar, disabled, placeholder }) {
   const [texto, setTexto] = useState('');
   const ref = useRef();
   useEffect(() => { if (!disabled && ref.current) ref.current.focus(); }, [disabled]);
-  const enviar = () => {
-    if (texto.trim() && !disabled) {
-      onEnviar(texto.trim());
-      setTexto('');
-    }
-  };
+  const enviar = () => { if (texto.trim() && !disabled) { onEnviar(texto.trim()); setTexto(''); } };
   return (
     <div className="border-t border-stone-200 bg-white p-4 rounded-b-2xl">
       <div className="flex gap-2">
-        <textarea
-          ref={ref}
-          value={texto}
-          onChange={(e) => setTexto(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); enviar(); }
-          }}
-          placeholder={placeholder || "Escribe tu respuesta..."}
-          rows={2}
-          disabled={disabled}
-          className="flex-1 border border-stone-300 rounded-lg p-2.5 resize-none focus:outline-none focus:border-[var(--color-accent)] text-sm disabled:bg-stone-50"
-        />
-        <button
-          onClick={enviar}
-          disabled={!texto.trim() || disabled}
-          className={`px-5 rounded-lg font-medium transition ${texto.trim() && !disabled ? 'bg-[var(--color-base)] text-white hover:bg-[var(--color-soft)]' : 'bg-stone-200 text-stone-400'}`}
-        >
-          Enviar
-        </button>
+        <textarea ref={ref} value={texto} onChange={(e) => setTexto(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); enviar(); } }}
+          placeholder={placeholder || "Escribe tu respuesta..."} rows={2} disabled={disabled}
+          className="flex-1 border border-stone-300 rounded-lg p-2.5 resize-none focus:outline-none focus:border-[var(--color-accent)] text-sm disabled:bg-stone-50" />
+        <button onClick={enviar} disabled={!texto.trim() || disabled} className={`px-5 rounded-lg font-medium transition ${texto.trim() && !disabled ? 'bg-[var(--color-base)] text-white hover:bg-[var(--color-soft)]' : 'bg-stone-200 text-stone-400'}`}>Enviar</button>
       </div>
       <p className="text-xs text-stone-400 mt-2">Enter para enviar · Shift+Enter para nueva línea</p>
     </div>
@@ -494,8 +410,6 @@ function PensandoIndicador() {
   );
 }
 
-// =================== APP ===================
-
 function App() {
   const [aceptado, setAceptado] = useState(() => localStorage.getItem('lb_disclaimer') === 'yes');
   const [mensajes, setMensajes] = useState([]);
@@ -503,21 +417,13 @@ function App() {
   const [pensando, setPensando] = useState(false);
   const [error, setError] = useState(null);
   const chatRef = useRef();
+  const sessionIdRef = useRef(getSessionId());
 
-  useEffect(() => {
-    if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
-  }, [mensajes, interaccion, pensando]);
-
-  useEffect(() => {
-    if (aceptado && mensajes.length === 0) iniciarConversacion();
-  }, [aceptado]);
+  useEffect(() => { if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight; }, [mensajes, interaccion, pensando]);
+  useEffect(() => { if (aceptado && mensajes.length === 0) iniciarConversacion(); }, [aceptado]);
 
   function iniciarConversacion() {
-    const msgInicial = {
-      rol: 'assistant',
-      contenido: "Hola. Cuéntame qué síntoma físico te está pasando. Descríbelo con tus propias palabras, no necesitas usar términos médicos. Cuando quieras estoy listo para empezar."
-    };
-    setMensajes([msgInicial]);
+    setMensajes([{ rol: 'assistant', contenido: "Hola. Cuéntame qué síntoma físico te está pasando. Descríbelo con tus propias palabras, no necesitas usar términos médicos. Cuando quieras estoy listo para empezar." }]);
     setInteraccion({ tipo: 'esperando_input', placeholder: 'Describe tu síntoma con tus propias palabras...' });
   }
 
@@ -527,25 +433,13 @@ function App() {
     setMensajes(nuevosMsgs);
     setInteraccion(null);
     setPensando(true);
-
-    const apiMessages = nuevosMsgs
-      .filter(m => m.rol === 'user' || m.rol === 'assistant')
-      .map(m => ({ role: m.rol === 'user' ? 'user' : 'assistant', content: m.contenido }));
-
+    const apiMessages = nuevosMsgs.filter(m => m.rol === 'user' || m.rol === 'assistant').map(m => ({ role: m.rol === 'user' ? 'user' : 'assistant', content: m.contenido }));
     try {
       let respuestaCruda = '';
-      await llamarBackend({
-        mensajes: apiMessages,
-        onChunk: (txt) => { respuestaCruda = txt; },
-      });
-
-      if (!respuestaCruda || respuestaCruda.trim().length === 0) {
-        throw new Error('La respuesta del servidor vino vacía. Intenta de nuevo.');
-      }
-
+      await llamarBackend({ mensajes: apiMessages, sessionId: sessionIdRef.current, onChunk: (txt) => { respuestaCruda = txt; } });
+      if (!respuestaCruda || respuestaCruda.trim().length === 0) throw new Error('Respuesta vacía del servidor.');
       const parsed = parsearRespuesta(respuestaCruda);
       if (!parsed) {
-        // Fallback: mostrar como mensaje plano
         setMensajes([...nuevosMsgs, { rol: 'assistant', contenido: respuestaCruda }]);
         setInteraccion({ tipo: 'esperando_input', placeholder: 'Continúa...' });
       } else {
@@ -563,96 +457,66 @@ function App() {
   function manejarRespuesta(parsed, nuevosMsgs) {
     const accion = parsed.siguiente_accion;
     const mensaje = parsed.mensaje || '';
-
-    // Caso especial: meditación → renderizar como card especial
     if (accion === 'meditacion' && mensaje.length > 200) {
       setMensajes([...nuevosMsgs, { rol: 'assistant', contenido: '', tipo: 'meditacion', texto: mensaje }]);
       setInteraccion({ tipo: 'esperando_input', placeholder: 'Cuéntame cómo te fue...' });
       return;
     }
-
-    // Caso normal: agregar mensaje de texto
-    if (mensaje) {
-      setMensajes([...nuevosMsgs, { rol: 'assistant', contenido: mensaje }]);
-    }
-
-    if (accion === 'pregunta_opciones' && parsed.preguntas?.length) {
-      setInteraccion({ tipo: 'opciones', preguntas: parsed.preguntas });
-    } else if (accion === 'analisis' && parsed.analisis) {
-      setInteraccion({ tipo: 'analisis', analisis: parsed.analisis });
-    } else if (accion === 'cierre') {
-      setInteraccion({ tipo: 'cierre' });
-    } else {
-      setInteraccion({ tipo: 'esperando_input', placeholder: 'Responde con tus propias palabras...' });
-    }
+    if (mensaje) setMensajes([...nuevosMsgs, { rol: 'assistant', contenido: mensaje }]);
+    if (accion === 'pregunta_opciones' && parsed.preguntas?.length) setInteraccion({ tipo: 'opciones', preguntas: parsed.preguntas });
+    else if (accion === 'analisis' && parsed.analisis) setInteraccion({ tipo: 'analisis', analisis: parsed.analisis });
+    else if (accion === 'cierre') setInteraccion({ tipo: 'cierre' });
+    else setInteraccion({ tipo: 'esperando_input', placeholder: 'Responde con tus propias palabras...' });
   }
 
   function reiniciar() {
     try { window.speechSynthesis.cancel(); } catch(e) {}
-    setMensajes([]);
-    setInteraccion(null);
-    setError(null);
+    sessionStorage.removeItem('lb_session_id');
+    sessionIdRef.current = getSessionId();
+    setMensajes([]); setInteraccion(null); setError(null);
     iniciarConversacion();
   }
 
-  if (!aceptado) {
-    return <DisclaimerScreen onAccept={() => { localStorage.setItem('lb_disclaimer', 'yes'); setAceptado(true); }} />;
-  }
+  if (!aceptado) return <DisclaimerScreen onAccept={() => { localStorage.setItem('lb_disclaimer', 'yes'); setAceptado(true); }} />;
 
   return (
     <div className="min-h-screen gradient-bg flex flex-col">
       <div className="border-b border-stone-200 bg-white/80 backdrop-blur sticky top-0 z-10">
         <div className="max-w-3xl mx-auto px-6 py-3 flex items-center justify-between">
           <Logo />
-          <button onClick={reiniciar} className="text-xs text-stone-500 hover:text-stone-700">
-            Nueva sesión
-          </button>
+          <button onClick={reiniciar} className="text-xs text-stone-500 hover:text-stone-700">Nueva sesión</button>
         </div>
       </div>
-
       <div className="flex-1 overflow-hidden flex flex-col max-w-3xl mx-auto w-full">
         <div ref={chatRef} className="flex-1 overflow-y-auto scroll-fade px-6 py-6">
           {mensajes.map((m, i) => {
-            if (m.tipo === 'meditacion') {
-              return <MeditacionCard key={i} texto={m.texto} />;
-            }
+            if (m.tipo === 'meditacion') return <MeditacionCard key={i} texto={m.texto} />;
             if (!m.contenido) return null;
             return <MensajeBurbuja key={i} rol={m.rol} contenido={m.contenido} />;
           })}
-
           {interaccion?.tipo === 'opciones' && interaccion.preguntas.map((p, i) => (
             <PreguntaOpciones key={`pregunta-${mensajes.length}-${i}`} pregunta={p} onResponder={enviarMensaje} />
           ))}
-
           {interaccion?.tipo === 'analisis' && <AnalisisCard analisis={interaccion.analisis} />}
-
           {pensando && <PensandoIndicador />}
-
           {error && (
             <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4 text-sm text-red-800">
               <strong>Error:</strong> {error}
               <button onClick={() => setError(null)} className="block text-xs mt-1 underline">Cerrar</button>
             </div>
           )}
-
           {interaccion?.tipo === 'cierre' && (
             <div className="bg-green-50 border border-green-200 rounded-lg p-4 mb-4 text-center">
               <p className="text-green-900 mb-3">Sesión cerrada.</p>
-              <button onClick={reiniciar} className="px-5 py-2 bg-[var(--color-base)] text-white rounded-lg text-sm hover:bg-[var(--color-soft)]">
-                Empezar nueva sesión
-              </button>
+              <button onClick={reiniciar} className="px-5 py-2 bg-[var(--color-base)] text-white rounded-lg text-sm">Empezar nueva sesión</button>
             </div>
           )}
         </div>
-
         {interaccion?.tipo === 'esperando_input' && (
           <InputLibre onEnviar={enviarMensaje} disabled={pensando} placeholder={interaccion.placeholder} />
         )}
       </div>
-
-      <div className="text-center py-3 text-xs text-stone-400">
-        No es diagnóstico médico
-      </div>
+      <div className="text-center py-3 text-xs text-stone-400">No es diagnóstico médico</div>
     </div>
   );
 }
