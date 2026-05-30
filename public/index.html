@@ -511,7 +511,6 @@ function CoachSection() {
     } catch (e) {
       console.error(e);
       setError(e.message);
-      // Quitar el último mensaje del usuario fallido del historial para permitir reintento limpio
       setMensajes(mensajes);
       setInteraccion({ tipo: 'esperando_input', placeholder: 'Reintenta o escribe otra cosa...' });
     } finally { setPensando(false); }
@@ -573,7 +572,7 @@ function CoachSection() {
         {error && (
           <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4 text-sm text-red-800">
             <strong>Error:</strong> {error}
-            <div className="flex gap-3 mt-2">
+            <div className="flex gap-3 mt-2 flex-wrap">
               {lastUserMsgRef.current && (
                 <button onClick={reintentarUltimo} className="text-xs px-3 py-1 bg-[var(--color-base)] text-white rounded">Reintentar último mensaje</button>
               )}
@@ -778,4 +777,27 @@ function App() {
   const [aceptado, setAceptado] = useState(() => localStorage.getItem('lb_disclaimer') === 'yes');
   const [tab, setTab] = useState(() => localStorage.getItem('lb_tab') || 'coach');
 
-  useEffect(() => { localStorage.setIt
+  useEffect(() => { localStorage.setItem('lb_tab', tab); }, [tab]);
+
+  if (!aceptado) return <DisclaimerScreen onAccept={() => { localStorage.setItem('lb_disclaimer', 'yes'); setAceptado(true); }} />;
+
+  return (
+    <div className="min-h-screen gradient-bg flex flex-col">
+      <div className="border-b border-stone-200 bg-white/80 backdrop-blur sticky top-0 z-10">
+        <div className="max-w-4xl mx-auto px-6 py-3 flex items-center justify-between">
+          <Logo onClick={() => setTab('coach')} />
+        </div>
+      </div>
+      <Tabs tab={tab} onChange={setTab} />
+      {tab === 'coach' && <CoachSection />}
+      {tab === 'buscar' && <BuscarSection />}
+      {tab === 'cofre' && <CofreSection />}
+      <div className="text-center py-3 text-xs text-stone-400">No es diagnóstico médico</div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
