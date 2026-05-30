@@ -511,7 +511,6 @@ function CoachSection() {
     } catch (e) {
       console.error(e);
       setError(e.message);
-      setMensajes(mensajes);
       setInteraccion({ tipo: 'esperando_input', placeholder: 'Reintenta o escribe otra cosa...' });
     } finally { setPensando(false); }
   }
