@@ -206,61 +206,84 @@ class handler(BaseHTTPRequestHandler):
             method="POST",
         )
 
-        respuesta_acumulada = ""
-        stop_reason = None
-        upstream_error = None
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self._set_cors()
+        self.end_headers()
 
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self._set_cors()
-            self.end_headers()
+        # Llamar a MiMo y consumir el stream. Devuelve (texto, stop_reason, error).
+        def stream_mimo(msgs):
+            payload_local = {
+                "model": MODEL,
+                "max_tokens": MAX_TOKENS,
+                "system": get_system_prompt(),
+                "messages": msgs,
+                "stream": True,
+            }
+            req_local = urllib.request.Request(
+                MIMO_URL,
+                data=json.dumps(payload_local).encode('utf-8'),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {MIMO_API_KEY}",
+                },
+                method="POST",
+            )
+            acc = ""
+            sr = None
+            err = None
+            try:
+                with urllib.request.urlopen(req_local, timeout=110) as resp:
+                    for line_bytes in resp:
+                        line = line_bytes.decode('utf-8', errors='replace').strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        raw = line[5:].strip()
+                        try:
+                            ev = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        et = ev.get("type")
+                        if et == "content_block_delta":
+                            text = ev.get("delta", {}).get("text", "")
+                            if text:
+                                acc += text
+                                self._emit({"chunk": text})
+                        elif et == "message_delta":
+                            sr2 = ev.get("delta", {}).get("stop_reason")
+                            if sr2:
+                                sr = sr2
+            except urllib.error.HTTPError as e:
+                err = f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}"
+            except Exception as e:
+                err = str(e)
+            return acc, sr, err
 
-            with urllib.request.urlopen(req, timeout=110) as resp:
-                for line_bytes in resp:
-                    line = line_bytes.decode('utf-8', errors='replace').strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    raw = line[5:].strip()
-                    try:
-                        ev = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    et = ev.get("type")
-                    if et == "content_block_delta":
-                        text = ev.get("delta", {}).get("text", "")
-                        if text:
-                            respuesta_acumulada += text
-                            self._emit({"chunk": text})
-                    elif et == "message_delta":
-                        sr = ev.get("delta", {}).get("stop_reason")
-                        if sr:
-                            stop_reason = sr
-                    elif et == "error":
-                        upstream_error = ev.get("error", {}).get("message") or str(ev)
-                        self._emit({"error": f"MiMo error: {upstream_error}"})
-                    elif et == "message_stop":
-                        pass
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode('utf-8', errors='replace')[:500]
-            upstream_error = f"HTTP {e.code}: {err_body}"
-            self._emit({"error": upstream_error})
-        except Exception as e:
-            upstream_error = str(e)
-            self._emit({"error": f"Error: {upstream_error}"})
+        respuesta_acumulada, stop_reason, upstream_error = stream_mimo(messages_trimmed)
 
-        # Si no llegó nada de contenido pero tampoco hubo error explícito,
-        # diagnosticar al usuario
-        if not respuesta_acumulada and not upstream_error:
-            razon = stop_reason or "respuesta vacía del modelo"
-            self._emit({
-                "error": (
-                    f"El modelo no devolvió contenido (motivo: {razon}). "
-                    "Esto suele pasar cuando la conversación ya es muy larga. "
-                    "Prueba 'Nueva sesión' o reintenta."
-                )
-            })
+        # Retry server-side si MiMo devolvió vacío con end_turn (caso conocido)
+        if not respuesta_acumulada and not upstream_error and stop_reason in ("end_turn", None):
+            nudge = list(messages_trimmed) + [
+                {"role": "assistant", "content": "(pausa)"},
+                {"role": "user", "content": "Continúa con tu respuesta, por favor."}
+            ]
+            r2, sr2, err2 = stream_mimo(nudge)
+            if r2:
+                respuesta_acumulada = r2
+                stop_reason = sr2
+
+        # Si tras el retry sigue vacío, emitir error honesto
+        if not respuesta_acumulada:
+            if upstream_error:
+                self._emit({"error": f"MiMo error: {upstream_error}"})
+            else:
+                self._emit({
+                    "error": (
+                        f"El modelo no respondió (stop_reason={stop_reason}). "
+                        "Intenta reformular tu mensaje o empezar una nueva sesión."
+                    )
+                })
 
         # Marcar fin de stream
         self._emit({"done": True})
