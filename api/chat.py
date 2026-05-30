@@ -16,7 +16,9 @@ from pathlib import Path
 MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")
 MODEL = os.environ.get("MODEL", "mimo-v2.5-pro")
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MIN", "20"))
-MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8000"))
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "2000"))
+# Mantener historial acotado para no exceder ventana de contexto
+MAX_HISTORY_PAIRS = int(os.environ.get("MAX_HISTORY_PAIRS", "8"))
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
@@ -41,9 +43,7 @@ def get_system_prompt():
             _SYSTEM_PROMPT = "Eres un coach de Leyes Biologicas."
     return _SYSTEM_PROMPT
 
-
 _rate_buckets = defaultdict(lambda: deque(maxlen=RATE_LIMIT))
-
 
 def check_rate_limit(ip):
     now = time.time()
@@ -56,28 +56,35 @@ def check_rate_limit(ip):
     return True
 
 
+def trim_history(messages, max_pairs):
+    """Conserva el primer mensaje (síntoma inicial) + últimos max_pairs turnos."""
+    if len(messages) <= max_pairs * 2 + 1:
+        return messages
+    head = messages[:1] if messages and messages[0].get("role") == "user" else []
+    tail = messages[-(max_pairs * 2):]
+    # Asegurar que arranca con user
+    if tail and tail[0].get("role") == "assistant":
+        tail = tail[1:]
+    return head + tail
+
+
 def guardar_conversacion(session_id, mensajes, ip_hash, user_agent, respuesta_final):
-    """UPSERT a Supabase. Falla silenciosamente si no hay creds."""
     if not (SUPABASE_URL and SUPABASE_KEY and session_id):
         return
 
-    # Extraer info útil de la conversación
     sintoma_inicial = ""
     for m in mensajes:
         if m.get("role") == "user":
             sintoma_inicial = m.get("content", "")[:500]
             break
 
-    # Detectar si hubo meditación
     genero_meditacion = False
     analisis = None
     try:
-        # Buscar en última respuesta del assistant
         if respuesta_final:
             r_low = respuesta_final.lower()
             if "meditacion" in r_low or "meditación" in r_low or '"meditacion"' in r_low:
                 genero_meditacion = True
-            # Intentar extraer análisis si está en JSON
             inicio = respuesta_final.find('"analisis"')
             if inicio > 0:
                 try:
@@ -89,7 +96,6 @@ def guardar_conversacion(session_id, mensajes, ip_hash, user_agent, respuesta_fi
     except Exception:
         pass
 
-    # Agregar respuesta final al historial
     mensajes_completos = list(mensajes)
     if respuesta_final:
         mensajes_completos.append({"role": "assistant", "content": respuesta_final[:30000]})
@@ -105,9 +111,7 @@ def guardar_conversacion(session_id, mensajes, ip_hash, user_agent, respuesta_fi
         "user_agent": (user_agent or "")[:300],
     }
 
-    # UPSERT por session_id (necesita unique constraint, hacemos delete + insert manual)
     try:
-        # Primero borrar existente
         del_url = f"{SUPABASE_URL}/rest/v1/lb_conversaciones?session_id=eq.{session_id}"
         req_del = urllib.request.Request(del_url, method="DELETE", headers={
             "apikey": SUPABASE_KEY,
@@ -118,8 +122,6 @@ def guardar_conversacion(session_id, mensajes, ip_hash, user_agent, respuesta_fi
             urllib.request.urlopen(req_del, timeout=4)
         except Exception:
             pass
-
-        # Insertar nuevo
         ins_url = f"{SUPABASE_URL}/rest/v1/lb_conversaciones"
         req_ins = urllib.request.Request(
             ins_url,
@@ -134,7 +136,6 @@ def guardar_conversacion(session_id, mensajes, ip_hash, user_agent, respuesta_fi
         )
         urllib.request.urlopen(req_ins, timeout=4)
     except Exception as e:
-        # No bloqueamos al usuario por esto
         print(f"supabase write error: {e}")
 
 
@@ -149,6 +150,14 @@ class handler(BaseHTTPRequestHandler):
         self.send_response(204)
         self._set_cors()
         self.end_headers()
+
+    def _emit(self, obj):
+        try:
+            self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode('utf-8'))
+            try: self.wfile.flush()
+            except Exception: pass
+        except Exception:
+            pass
 
     def do_POST(self):
         if not MIMO_API_KEY:
@@ -176,11 +185,14 @@ class handler(BaseHTTPRequestHandler):
             self._send_error(400, f"Body inválido: {e}")
             return
 
+        # Recortar historial para evitar context overflow
+        messages_trimmed = trim_history(messages, MAX_HISTORY_PAIRS)
+
         payload = {
             "model": MODEL,
             "max_tokens": MAX_TOKENS,
             "system": get_system_prompt(),
-            "messages": messages,
+            "messages": messages_trimmed,
             "stream": True,
         }
 
@@ -195,6 +207,8 @@ class handler(BaseHTTPRequestHandler):
         )
 
         respuesta_acumulada = ""
+        stop_reason = None
+        upstream_error = None
 
         try:
             self.send_response(200)
@@ -211,29 +225,46 @@ class handler(BaseHTTPRequestHandler):
                     raw = line[5:].strip()
                     try:
                         ev = json.loads(raw)
-                        if ev.get("type") == "content_block_delta":
-                            text = ev.get("delta", {}).get("text", "")
-                            if text:
-                                respuesta_acumulada += text
-                                out = json.dumps({"chunk": text}, ensure_ascii=False)
-                                self.wfile.write(f"data: {out}\n\n".encode('utf-8'))
-                                try: self.wfile.flush()
-                                except Exception: pass
-                        elif ev.get("type") == "message_stop":
-                            self.wfile.write(b"data: [DONE]\n\n")
                     except json.JSONDecodeError:
+                        continue
+                    et = ev.get("type")
+                    if et == "content_block_delta":
+                        text = ev.get("delta", {}).get("text", "")
+                        if text:
+                            respuesta_acumulada += text
+                            self._emit({"chunk": text})
+                    elif et == "message_delta":
+                        sr = ev.get("delta", {}).get("stop_reason")
+                        if sr:
+                            stop_reason = sr
+                    elif et == "error":
+                        upstream_error = ev.get("error", {}).get("message") or str(ev)
+                        self._emit({"error": f"MiMo error: {upstream_error}"})
+                    elif et == "message_stop":
                         pass
         except urllib.error.HTTPError as e:
-            err_body = e.read().decode('utf-8', errors='replace')
-            msg = json.dumps({"error": f"MiMo {e.code}: {err_body}"}, ensure_ascii=False)
-            try: self.wfile.write(f"data: {msg}\n\n".encode('utf-8'))
-            except Exception: pass
+            err_body = e.read().decode('utf-8', errors='replace')[:500]
+            upstream_error = f"HTTP {e.code}: {err_body}"
+            self._emit({"error": upstream_error})
         except Exception as e:
-            msg = json.dumps({"error": f"Error: {str(e)}"}, ensure_ascii=False)
-            try: self.wfile.write(f"data: {msg}\n\n".encode('utf-8'))
-            except Exception: pass
+            upstream_error = str(e)
+            self._emit({"error": f"Error: {upstream_error}"})
 
-        # Guardar en Supabase DESPUÉS de cerrar stream (no bloquea al usuario)
+        # Si no llegó nada de contenido pero tampoco hubo error explícito,
+        # diagnosticar al usuario
+        if not respuesta_acumulada and not upstream_error:
+            razon = stop_reason or "respuesta vacía del modelo"
+            self._emit({
+                "error": (
+                    f"El modelo no devolvió contenido (motivo: {razon}). "
+                    "Esto suele pasar cuando la conversación ya es muy larga. "
+                    "Prueba 'Nueva sesión' o reintenta."
+                )
+            })
+
+        # Marcar fin de stream
+        self._emit({"done": True})
+
         try:
             guardar_conversacion(session_id, messages, ip_hash, user_agent, respuesta_acumulada)
         except Exception as e:
@@ -250,6 +281,8 @@ class handler(BaseHTTPRequestHandler):
             "has_api_key": bool(MIMO_API_KEY),
             "has_supabase": bool(SUPABASE_URL and SUPABASE_KEY),
             "system_prompt_loaded": bool(get_system_prompt()),
+            "max_tokens": MAX_TOKENS,
+            "max_history_pairs": MAX_HISTORY_PAIRS,
         }).encode('utf-8'))
 
     def _send_error(self, code, msg):
