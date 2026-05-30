@@ -201,7 +201,8 @@ async function llamarChat({ mensajes, sessionId, onChunk }) {
           const ev = JSON.parse(data);
           if (ev.chunk) { textoCompleto += ev.chunk; if (onChunk) onChunk(textoCompleto); }
           else if (ev.error) throw new Error(ev.error);
-        } catch (e) { if (e.message?.startsWith('Servidor')) throw e; }
+          else if (ev.done) { /* fin de stream */ }
+        } catch (e) { if (e.message?.startsWith('Servidor') || e.message?.startsWith('MiMo') || e.message?.startsWith('El modelo')) throw e; }
       }
     }
     clearTimeout(timeoutId);
@@ -480,6 +481,7 @@ function CoachSection() {
   const [error, setError] = useState(null);
   const chatRef = useRef();
   const sessionIdRef = useRef(getSessionId());
+  const lastUserMsgRef = useRef(null);
 
   useEffect(() => { if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight; }, [mensajes, interaccion, pensando]);
   useEffect(() => { if (mensajes.length === 0) iniciar(); }, []);
@@ -491,6 +493,7 @@ function CoachSection() {
 
   async function enviar(texto) {
     setError(null);
+    lastUserMsgRef.current = texto;
     const nuevos = [...mensajes, { rol: 'user', contenido: texto }];
     setMensajes(nuevos);
     setInteraccion(null);
@@ -508,8 +511,17 @@ function CoachSection() {
     } catch (e) {
       console.error(e);
       setError(e.message);
-      setInteraccion({ tipo: 'esperando_input', placeholder: 'Reintenta...' });
+      // Quitar el último mensaje del usuario fallido del historial para permitir reintento limpio
+      setMensajes(mensajes);
+      setInteraccion({ tipo: 'esperando_input', placeholder: 'Reintenta o escribe otra cosa...' });
     } finally { setPensando(false); }
+  }
+
+  function reintentarUltimo() {
+    if (lastUserMsgRef.current) {
+      setError(null);
+      enviar(lastUserMsgRef.current);
+    }
   }
 
   function manejar(parsed, nuevos) {
@@ -561,7 +573,13 @@ function CoachSection() {
         {error && (
           <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4 text-sm text-red-800">
             <strong>Error:</strong> {error}
-            <button onClick={() => setError(null)} className="block text-xs mt-1 underline">Cerrar</button>
+            <div className="flex gap-3 mt-2">
+              {lastUserMsgRef.current && (
+                <button onClick={reintentarUltimo} className="text-xs px-3 py-1 bg-[var(--color-base)] text-white rounded">Reintentar último mensaje</button>
+              )}
+              <button onClick={nuevaSesion} className="text-xs px-3 py-1 bg-stone-200 rounded">Empezar nueva sesión</button>
+              <button onClick={() => setError(null)} className="text-xs underline">Cerrar</button>
+            </div>
           </div>
         )}
         {interaccion?.tipo === 'cierre' && (
@@ -760,27 +778,4 @@ function App() {
   const [aceptado, setAceptado] = useState(() => localStorage.getItem('lb_disclaimer') === 'yes');
   const [tab, setTab] = useState(() => localStorage.getItem('lb_tab') || 'coach');
 
-  useEffect(() => { localStorage.setItem('lb_tab', tab); }, [tab]);
-
-  if (!aceptado) return <DisclaimerScreen onAccept={() => { localStorage.setItem('lb_disclaimer', 'yes'); setAceptado(true); }} />;
-
-  return (
-    <div className="min-h-screen gradient-bg flex flex-col">
-      <div className="border-b border-stone-200 bg-white/80 backdrop-blur sticky top-0 z-10">
-        <div className="max-w-4xl mx-auto px-6 py-3 flex items-center justify-between">
-          <Logo onClick={() => setTab('coach')} />
-        </div>
-      </div>
-      <Tabs tab={tab} onChange={setTab} />
-      {tab === 'coach' && <CoachSection />}
-      {tab === 'buscar' && <BuscarSection />}
-      {tab === 'cofre' && <CofreSection />}
-      <div className="text-center py-3 text-xs text-stone-400">No es diagnóstico médico</div>
-    </div>
-  );
-}
-
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
-</script>
-</body>
-</html>
+  useEffect(() => { localStorage.setIt
